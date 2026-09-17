@@ -1,0 +1,6 @@
+streamlit>=1.40,<2
+pandas>=2.0,<3
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+phonenumbers>=8.13
+ddgs>=9.0

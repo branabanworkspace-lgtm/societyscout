@@ -1,0 +1,18 @@
+# Your collected data: keep it out of GitHub, especially in a public repo.
+data/
+exports/
+*.csv
+!uk_universities.csv
+!universities_example.txt
+
+# Secrets: never commit these.
+.streamlit/secrets.toml
+.env
+
+# Python and editor bits
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/

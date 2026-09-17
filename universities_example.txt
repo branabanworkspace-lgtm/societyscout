@@ -1,0 +1,5 @@
+# One university per line. If you know the students' union societies page,
+# add it after a comma, e.g.:  University of Leeds, https://...
+University of Leeds
+University of Manchester
+Durham University
