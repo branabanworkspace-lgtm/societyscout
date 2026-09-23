@@ -67,7 +67,7 @@ def running_in_cloud() -> bool:
 
 # Websites see this in every request, so site owners know who is visiting. Set
 # it here, or as SOCIETYSCOUT_CONTACT in your environment or Streamlit secrets.
-CONTACT_EMAIL = setting("SOCIETYSCOUT_CONTACT", "outreach@your-brand.co.uk")
+CONTACT_EMAIL = setting("SOCIETYSCOUT_CONTACT", "branaban.workspace@gmail.com")
 
 USER_AGENT = f"SocietyScout/1.0 (society outreach research; {CONTACT_EMAIL})"
 ROBOTS_NAME = "SocietyScout"
