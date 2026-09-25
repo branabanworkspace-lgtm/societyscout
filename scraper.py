@@ -19,9 +19,11 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import html
 import io
 import os
+import random
 import re
 import sys
 import time
@@ -32,8 +34,35 @@ from typing import Callable, Optional
 from urllib import robotparser
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
-import requests
-from bs4 import BeautifulSoup
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError as exc:
+    missing = getattr(exc, "name", None) or str(exc).split("'")[-2:-1] or ["a required"]
+    missing = missing if isinstance(missing, str) else (missing[0] if missing else "a required")
+    try:
+        here = Path(__file__).resolve().parent
+    except NameError:
+        here = Path.cwd()
+    venv = here / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python")
+    start = "start_windows.bat" if os.name == "nt" else "start_mac.command"
+    print(f"""
+SocietyScout can't start: the '{missing}' library isn't installed for this Python.
+
+Easiest fix
+  Double-click {start} in the SocietyScout folder. It installs everything
+  the first time and opens the app.
+
+To use the command line instead, first run {start} once, then use the Python
+inside the .venv folder rather than plain 'python':
+
+  {venv} scraper.py "University of Leeds"
+
+Or install the libraries for the Python you are using right now:
+
+  {sys.executable} -m pip install -r requirements.txt
+""".rstrip())
+    sys.exit(1)
 
 try:
     import phonenumbers
@@ -90,9 +119,12 @@ MASTER_CSV = DATA_DIR / "societies_master.csv"
 UNIVERSITIES_CSV = BASE_DIR / "uk_universities.csv"   # every UK recognised university
 UNION_SITES_CSV = DATA_DIR / "union_sites.csv"        # societies pages found, cached
 COVERAGE_CSV = DATA_DIR / "coverage.csv"              # how each university went
+AUDIT_LOG = DATA_DIR / "fetch_log.csv"                # every page visited, for the record
+CACHE_DIR = DATA_DIR / "page_cache"                   # pages already read, to avoid asking twice
+CACHE_DAYS = 7
 
 DEFAULT_MAX_PAGES = 150   # pages checked per search
-DEFAULT_DELAY = 1.0       # seconds between requests to the same website
+DEFAULT_DELAY = 2.0       # seconds between requests to the same website
 
 COLUMNS = [
     ("org", "University / Organisation"),
@@ -192,23 +224,127 @@ def url_key(url: str) -> str:
 
 # -------------------------------------------------------- polite fetching --
 
-class Fetcher:
-    """Downloads pages politely: follows robots.txt and waits between requests."""
+BOT_WALL_HEADERS = ("cf-mitigated", "x-akamai-bot", "x-iinfo", "x-sucuri-id", "x-datadome")
+BOT_WALL_TEXT = re.compile(
+    r"(just a moment|checking your browser|enable javascript and cookies|"
+    r"attention required!?\s*\|?\s*cloudflare|ddos protection by|"
+    r"access denied[^a-z]{0,20}(you do not have permission|reference #)|"
+    r"request unsuccessful.*incapsula|pardon our interruption|"
+    r"verify you are (a )?human|are you a robot)", re.I)
 
-    def __init__(self, delay: float = DEFAULT_DELAY, timeout: int = 15,
-                 respect_robots: bool = True, log: LogFn = print):
+
+def is_bot_challenge(resp) -> bool:
+    """True when the reply is a bot-protection challenge rather than the page.
+    Knowing the difference matters: a challenge is a wall in front of everyone
+    automated, not a judgement about this tool, and no amount of polite retrying
+    will get through it."""
+    if any(h in resp.headers for h in BOT_WALL_HEADERS):
+        return True
+    server = resp.headers.get("Server", "").lower()
+    body = ""
+    try:
+        body = resp.text[:4000]
+    except Exception:
+        return False
+    if BOT_WALL_TEXT.search(body):
+        return True
+    return "cloudflare" in server and resp.status_code in (403, 503)
+
+
+class SiteRefusedError(Exception):
+    """A website has told us to stop. We stop."""
+
+    def __init__(self, host: str, reason: str):
+        super().__init__(f"{host}: {reason}")
+        self.host = host
+        self.reason = reason
+
+
+class Fetcher:
+    """Reads public web pages, gently.
+
+    It only ever performs GET requests, the same thing a browser does when you
+    open a page. It never signs in, submits a form, or tries to get around a
+    site's defences. It identifies itself honestly, obeys robots.txt, waits
+    between pages, and stops visiting a site that asks it to.
+    """
+
+    # How many refusals from one website before we leave it alone entirely.
+    REFUSALS_BEFORE_STOPPING = 2
+
+    def __init__(self, delay: float = DEFAULT_DELAY, timeout: int = 20,
+                 respect_robots: bool = True, log: LogFn = print,
+                 cache: bool = True, audit: bool = True):
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-GB,en;q=0.9",
+            "From": CONTACT_EMAIL,   # the standard header for "who is running this"
         })
         self.delay = delay
         self.timeout = timeout
         self.respect_robots = respect_robots
         self.log = log
+        self.cache = cache
+        self.audit = audit
         self._robots: dict[str, robotparser.RobotFileParser] = {}
         self._last_hit: dict[str, float] = {}
+        self._refusals: Counter = Counter()
+        self.blocked_hosts: set[str] = set()
+        self.fetched = 0
+        self.from_cache = 0
+        self.last_outcome = ""   # why the last get() returned nothing
+
+    @property
+    def pushed_back(self) -> set:
+        """Hosts that have turned us away at least once."""
+        return set(self._refusals) | self.blocked_hosts
+
+    # -- the record of what was visited ------------------------------------
+    def _record(self, url: str, status, note: str = "") -> None:
+        if not self.audit:
+            return
+        try:
+            AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+            new = not AUDIT_LOG.exists()
+            with open(AUDIT_LOG, "a", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh, lineterminator="\r\n")
+                if new:
+                    writer.writerow(["when", "method", "url", "status", "note"])
+                writer.writerow([dt.datetime.now().isoformat(timespec="seconds"), "GET",
+                                 url, status, note])
+        except OSError:
+            self.audit = False  # never let logging break a run
+
+    # -- a copy of pages already read, so we don't ask twice ---------------
+    def _cache_path(self, url: str) -> Path:
+        digest = hashlib.sha256(url.encode()).hexdigest()[:24]
+        return CACHE_DIR / digest[:2] / f"{digest}.html"
+
+    def _from_cache(self, url: str) -> Optional[str]:
+        if not self.cache:
+            return None
+        path = self._cache_path(url)
+        if not path.exists():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if age > CACHE_DAYS * 86400:
+            return None
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def _to_cache(self, url: str, text: str) -> None:
+        if not self.cache:
+            return
+        try:
+            path = self._cache_path(url)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
 
     def _robots_for(self, url: str) -> robotparser.RobotFileParser:
         p = urlparse(url)
@@ -244,18 +380,51 @@ class Fetcher:
         try:
             robots_delay = self._robots_for(url).crawl_delay(ROBOTS_NAME)
             if robots_delay:
-                delay = max(delay, float(robots_delay))
+                delay = max(delay, float(robots_delay))  # the site's own pace wins
         except Exception:
             pass
+        # A little randomness, so requests don't arrive like clockwork. This is
+        # about being a lighter load, not about hiding: the User-Agent still
+        # says exactly what this is.
+        delay += random.uniform(0, delay * 0.4)
         remaining = delay - (time.time() - self._last_hit.get(host, 0.0))
         if remaining > 0:
-            time.sleep(min(remaining, 30))
+            time.sleep(min(remaining, 60))
+
+    def _refused(self, host: str, reason: str) -> None:
+        """A site pushed back. Count it, and walk away after a few."""
+        self._refusals[host] += 1
+        if self._refusals[host] >= self.REFUSALS_BEFORE_STOPPING:
+            self.blocked_hosts.add(host)
+            self.log(f"{host} is turning requests away, so SocietyScout has stopped visiting it. "
+                     f"Ask the union for their societies list directly.")
+            raise SiteRefusedError(host, reason)
 
     def get(self, url: str, want_html: bool = True) -> Optional[requests.Response]:
-        if not self.allowed(url):
-            self.log(f"Skipped (the site asks bots not to visit this page): {url}")
-            return None
         host = urlparse(url).netloc
+        self.last_outcome = ""
+        if host in self.blocked_hosts:
+            self.last_outcome = "refused"
+            return None
+
+        cached = self._from_cache(url)
+        if cached is not None:
+            self.from_cache += 1
+            resp = requests.Response()
+            resp._content = cached.encode("utf-8")
+            resp.status_code = 200
+            resp.url = url
+            resp.headers["Content-Type"] = "text/html; charset=utf-8"
+            resp.encoding = "utf-8"
+            self.last_outcome = "ok"
+            return resp
+
+        if not self.allowed(url):
+            self._record(url, "skipped", "robots.txt asks bots not to visit")
+            self.log(f"Skipped (the site asks bots not to visit this page): {url}")
+            self.last_outcome = "robots"
+            return None
+
         for attempt in range(3):
             self._wait(url)
             try:
@@ -263,21 +432,48 @@ class Fetcher:
             except requests.RequestException as exc:
                 self._last_hit[host] = time.time()
                 if attempt == 2:
+                    self._record(url, "error", exc.__class__.__name__)
                     self.log(f"Couldn't load {url} ({exc.__class__.__name__})")
+                    self.last_outcome = "error"
                     return None
-                time.sleep(2 * (attempt + 1))
+                time.sleep(3 * (attempt + 1))
                 continue
             self._last_hit[host] = time.time()
+            self.fetched += 1
+            self._record(url, r.status_code)
+
+            # "Slow down" or "busy": wait as long as the site asks, then retry.
             if r.status_code in (429, 503):
                 retry = r.headers.get("Retry-After", "")
-                time.sleep(min(int(retry) if retry.isdigit() else 10 * (attempt + 1), 60))
+                wait = int(retry) if retry.isdigit() else min(20 * (2 ** attempt), 120)
+                self.log(f"{host} asked us to slow down. Waiting {wait}s.")
+                time.sleep(min(wait, 120))
+                if attempt == 2:
+                    self._refused(host, f"HTTP {r.status_code}")
                 continue
-            if r.status_code >= 400:
+
+            # "No": don't argue with it, and don't try to look like someone else.
+            if r.status_code in (401, 403):
+                why = "HTTP 403" if r.status_code == 403 else "HTTP 401 (sign-in needed)"
+                if is_bot_challenge(r):
+                    why = "bot protection (a challenge page, not a real refusal of you)"
+                self._refused(host, why)
+                self.last_outcome = "refused"
                 return None
+
+            if r.status_code >= 400:
+                # Just "no such page here" — this site is laid out differently.
+                self.last_outcome = "notfound"
+                return None
+
             ctype = r.headers.get("Content-Type", "").lower()
             if want_html and "html" not in ctype:
+                self.last_outcome = "nonhtml"
                 return None
+            self._to_cache(url, r.text)
+            self.last_outcome = "ok"
             return r
+        self.last_outcome = self.last_outcome or "error"
         return None
 
 
@@ -697,14 +893,36 @@ CHROME_NAME = re.compile(r"^(site-?footer|site-?header|footer|global-?nav|main-?
                          r"mega-?menu|cookie.*|breadcrumbs?|masthead|skip-?link.*)$", re.I)
 
 
-def strip_page_chrome(soup) -> None:
-    """Removes menus, headers and footers so the union's own contact details
-    don't get attached to every society."""
+def chrome_nodes(soup) -> list:
+    """The page furniture: menus, headers, footers, cookie bars."""
     targets = soup.find_all(["script", "style", "noscript", "template", "svg", "iframe", "nav", "footer"])
     targets += [h for h in soup.find_all("header") if not h.find_parent(["main", "article"])]
     targets += soup.find_all(True, attrs={"class": CHROME_NAME})
     targets += soup.find_all(True, attrs={"id": CHROME_NAME})
-    for tag in targets:
+    return targets
+
+
+def harvest_union_contacts(soup) -> set:
+    """Contact details sitting in the page furniture belong to the union, not to
+    any society. Collected before that furniture is thrown away, so they can be
+    kept out of every society's record."""
+    found: set = set()
+    for tag in chrome_nodes(soup):
+        if getattr(tag, "decomposed", False) or tag.name in ("script", "style", "template", "svg"):
+            continue
+        text = clean(tag.get_text(" "))
+        if not text:
+            continue
+        found.update(find_emails(tag, text))
+        found.update(find_phones(tag, text))
+        found.update(find_socials(tag, text))
+    return found
+
+
+def strip_page_chrome(soup) -> None:
+    """Removes menus, headers and footers so the union's own contact details
+    don't get attached to every society."""
+    for tag in chrome_nodes(soup):
         if not getattr(tag, "decomposed", False):
             tag.decompose()
 
@@ -932,11 +1150,13 @@ def sitemap_society_urls(start_urls: list[str], fetcher: Fetcher, hosts: set[str
 
 
 def crawl_site(start_urls: list[str], org: str, fetcher: Fetcher, max_pages: int,
-               progress: ProgressFn, log: LogFn, should_stop: StopFn) -> tuple[list[Finding], int]:
+               progress: ProgressFn, log: LogFn,
+               should_stop: StopFn) -> tuple[list[Finding], int, set]:
     hosts = {bare_host(urlparse(u).netloc) for u in start_urls}
     queue: deque = deque((u, None) for u in start_urls)
     seen = {url_key(u) for u in start_urls}
     findings: dict[str, Finding] = {}
+    union_contacts: set = set()
     h1_seen: Counter = Counter()
     pages = 0
     sitemap_tried = False
@@ -983,8 +1203,18 @@ def crawl_site(start_urls: list[str], org: str, fetcher: Fetcher, max_pages: int
                 h1_seen[norm(names[0])] += 1
             subpages = contact_subpages(soup, final_url, hosts) if parent is None else []
 
-            strip_page_chrome(soup)
+            # Links to follow are taken from the WHOLE page: some unions put
+            # their A-Z inside a nav or sidebar, and that furniture is about to
+            # be thrown away for contact extraction.
             links = society_links(soup, final_url, hosts)
+            # Anything in that furniture is the union's own contact detail, so
+            # note it now and keep it out of every society's record later.
+            union_contacts.update(harvest_union_contacts(soup))
+
+            strip_page_chrome(soup)
+            # Links inside the society's own content decide whether this page is
+            # a listing or a single society.
+            content_links = society_links(soup, final_url, hosts)
 
             if parent is not None:
                 if parent in findings:
@@ -996,7 +1226,7 @@ def crawl_site(start_urls: list[str], org: str, fetcher: Fetcher, max_pages: int
                 if url_key(link) not in sub_keys:
                     enqueue(link)
 
-            if len(links) >= LISTING_MIN_LINKS or not name or is_generic_name(name, org):
+            if len(content_links) >= LISTING_MIN_LINKS or not name or is_generic_name(name, org):
                 for f in inline_findings(soup, final_url, org):
                     add(f)
                 continue
@@ -1008,10 +1238,53 @@ def crawl_site(start_urls: list[str], org: str, fetcher: Fetcher, max_pages: int
                 enqueue(sub, parent=key, front=True)
     except KeyboardInterrupt:
         log("Stopped. Keeping what was found so far.")
+    except SiteRefusedError:
+        log("Keeping what was found before the site asked us to stop.")
 
     if pages >= max_pages and queue:
         log(f"Reached the {max_pages}-page limit. Raise 'Pages to check' to find more.")
-    return list(findings.values()), pages
+    if pages <= 2 and len(seen) > 5:
+        log(f"Only {plural(pages, 'page was', 'pages were')} read even though "
+            f"{len(seen)} society links were found. Run --diagnose to see why.")
+    return list(findings.values()), pages, union_contacts
+
+
+# Addresses like theunion@, su@, sports.union@ belong to the students' union
+# office, never to a society, however they turn up on the page.
+UNION_EMAIL = re.compile(r"^(the)?(union|su|studentsunion|students-union|guild)(office|s)?@|"
+                         r"^(societies|activities|sports|clubs|groups|membership|welfare|"
+                         r"studentvoice|reception|advice)([._-](union|su|office|team))?@|"
+                         r"^(union|su)[._-]|^[^@]*[._-](union|su)@", re.I)
+
+
+def drop_union_office_emails(findings: list) -> int:
+    """A society whose only listed address is the union office has no address of
+    its own. Saying so is more useful than handing the team the wrong contact."""
+    dropped = 0
+    for f in findings:
+        own = [e for e in f.emails if not UNION_EMAIL.match(e)]
+        if len(own) != len(f.emails):
+            dropped += len(f.emails) - len(own)
+            f.emails = own
+    return dropped
+
+
+def drop_union_contacts(findings: list, union_contacts: set, log: LogFn) -> None:
+    """Removes the union's own switchboard, info@ address and social accounts
+    from every society. These come from the site's headers, footers and menus,
+    so they are the union's, not any society's."""
+    if not union_contacts:
+        return
+    removed = 0
+    for f in findings:
+        before = len(f.emails) + len(f.phones) + len(f.socials)
+        f.emails = [e for e in f.emails if e not in union_contacts]
+        f.phones = [p for p in f.phones if p not in union_contacts]
+        f.socials = [s for s in f.socials if s not in union_contacts]
+        removed += before - (len(f.emails) + len(f.phones) + len(f.socials))
+    if removed:
+        log(f"Left out {removed} contact details that belong to the union itself, "
+            "not to a society.")
 
 
 def remove_sitewide(findings: list[Finding]) -> None:
@@ -1084,7 +1357,10 @@ def company_search(name: str, fetcher: Fetcher, max_pages: int, progress: Progre
             f = Finding(org=name, society=label, source=url, socials=[social],
                         emails=find_emails(BeautifulSoup("", "html.parser"), snippet))
         else:
-            resp = fetcher.get(url)
+            try:
+                resp = fetcher.get(url)
+            except SiteRefusedError:
+                continue
             if resp is None:
                 continue
             soup = BeautifulSoup(resp.content, "html.parser")
@@ -1210,7 +1486,10 @@ def deep_search_one(f: Finding, fetcher: Fetcher, log: LogFn, should_stop: StopF
     for url in deep_candidates(f, log):
         if opened >= DEEP_MAX_PAGES or should_stop():
             break
-        resp = fetcher.get(url)
+        try:
+            resp = fetcher.get(url)
+        except SiteRefusedError:
+            continue  # that site is off limits now; try the next candidate
         opened += 1
         if resp is None:
             continue
@@ -1243,7 +1522,7 @@ def deep_search(findings: list, fetcher: Fetcher, progress: ProgressFn, log: Log
         try:
             if deep_search_one(f, fetcher, log, should_stop):
                 improved += 1
-        except requests.RequestException:
+        except (requests.RequestException, SiteRefusedError):
             continue
         if i < len(todo):
             time.sleep(1.0)  # the search engine is a shared resource too
@@ -1295,10 +1574,51 @@ def save_union_site(name: str, url: str) -> None:
 # Paths used by the platforms most UK students' unions run on, plus common
 # hand-built ones. Probed directly so a university works even when the web
 # search can't find its societies page.
-UNION_PATHS = ["/organisation/", "/groups/", "/activities/", "/societies",
-               "/societies/", "/clubs-and-societies", "/student-groups",
-               "/sports-and-societies", "/get-involved/societies", "/activities/societies",
-               "/clubs", "/sport/clubs", "/whats-on/societies", "/join/societies"]
+# Only the handful of addresses the main union website platforms actually use,
+# and only tried when the site map hasn't already answered the question. A long
+# list of guesses produces a burst of "not found" responses, which is what makes
+# a firewall treat a visitor as a scanner.
+# The paths the main UK union website platforms actually use. MSL, which most
+# unions run on, serves its A-Z at /activities or /organisation depending on how
+# the union configured it, so both are tried. A "not found" here just means this
+# union is laid out differently, and costs the site almost nothing, so we work
+# through the list. Repeated timeouts or a refusal do stop it.
+UNION_PATHS = ["/activities", "/societies", "/organisation/", "/groups/",
+               "/clubs-and-societies", "/student-groups", "/clubs", "/sports"]
+
+
+def parent_url(url: str) -> str:
+    p = urlparse(url)
+    parent = (p.path.rstrip("/").rsplit("/", 1)[0]) or ""
+    return f"{p.scheme}://{p.netloc}{parent}/"
+
+
+def directory_from_sitemap(root: str, fetcher: Fetcher, log: LogFn) -> list[str]:
+    """Reads the site's own site map instead of guessing at page addresses.
+    Sites publish these so visitors can find their pages, and it means no
+    speculative requests for addresses that don't exist."""
+    hosts = {bare_host(urlparse(root).netloc)}
+    try:
+        urls = sitemap_society_urls([root], fetcher, hosts, limit=400)
+    except SiteRefusedError:
+        return []
+    if len(urls) < 5:
+        return []
+    log(f"The site map lists {len(urls)} society pages, so no guessing is needed.")
+    parent, count = Counter(parent_url(u) for u in urls).most_common(1)[0]
+    if count >= 8:
+        try:
+            resp = fetcher.get(parent)  # one request to check the listing page
+        except SiteRefusedError:
+            return urls
+        if resp is not None:
+            return [normalise_url(resp.url) or parent]
+        if fetcher.last_outcome == "robots":
+            # Some unions put their A-Z off limits to bots but leave the
+            # individual society pages open. Use those directly.
+            log("The A-Z page is off limits to bots, so the society pages from "
+                "the site map are used instead.")
+    return urls
 
 
 def probe_union_paths(host_url: str, fetcher: Fetcher, org: str) -> tuple[str, int]:
@@ -1306,16 +1626,22 @@ def probe_union_paths(host_url: str, fetcher: Fetcher, org: str) -> tuple[str, i
     Returns the page with the most society links, and how many it had."""
     hosts = {bare_host(urlparse(host_url).netloc)}
     best, best_count = "", 0
-    misses = 0
+    unreachable = 0
     for path in UNION_PATHS:
         url = normalise_url(urljoin(host_url, path))
         if not url:
             continue
-        resp = fetcher.get(url)
+        try:
+            resp = fetcher.get(url)
+        except SiteRefusedError:
+            break
         if resp is None:
-            misses += 1
-            if misses >= 4 and not best_count:
-                break  # the website isn't answering, or isn't laid out this way
+            # A missing page means this union uses different addresses, so keep
+            # looking. Only stop when the site can't be reached or says no.
+            if fetcher.last_outcome in ("error", "refused"):
+                unreachable += 1
+                if unreachable >= 2:
+                    break
             continue
         final = normalise_url(resp.url) or url
         soup = BeautifulSoup(resp.content, "html.parser")
@@ -1328,12 +1654,12 @@ def probe_union_paths(host_url: str, fetcher: Fetcher, org: str) -> tuple[str, i
     return best, best_count
 
 
-def find_union_site(name: str, fetcher: Fetcher, log: LogFn = print) -> str:
+def find_union_site(name: str, fetcher: Fetcher, log: LogFn = print) -> list[str]:
     """Finds a university's societies page: cache first, then the standard
     paths on its union website, then a plain web search."""
     cached = load_union_sites().get(norm(name))
     if cached:
-        return cached["union_url"]
+        return [cached["union_url"]]
 
     tokens = name_tokens(name)
     candidates: list[tuple[int, str]] = []
@@ -1351,7 +1677,7 @@ def find_union_site(name: str, fetcher: Fetcher, log: LogFn = print) -> str:
             score += 2
         if re.search(r"union|guild|students", res.get("title", ""), re.I):
             score += 1
-        candidates.append((score, f"https://{host}/"))
+        candidates.append((score, f"{urlparse(url).scheme}://{host}/"))
 
     seen, ordered = set(), []
     for score, root in sorted(candidates, key=lambda x: -x[0]):
@@ -1360,16 +1686,21 @@ def find_union_site(name: str, fetcher: Fetcher, log: LogFn = print) -> str:
             ordered.append(root)
 
     for root in ordered[:3]:
+        from_map = directory_from_sitemap(root, fetcher, log)
+        if from_map:
+            if len(from_map) == 1:
+                save_union_site(name, from_map[0])
+            return from_map
         url, count = probe_union_paths(root, fetcher, name)
         if count >= 8:
             save_union_site(name, url)
-            return url
+            return [url]
 
     found = find_directories(name, log)
     if found:
         save_union_site(name, found[0])
-        return found[0]
-    return ""
+        return [found[0]]
+    return []
 
 
 # ------------------------------------------------------------- main search --
@@ -1403,22 +1734,31 @@ def run_search(name: str, url: Optional[str] = None, company: bool = False,
         if not start:
             raise ValueError("That web address doesn't look right. It should start with https://")
         start_urls = [start]
-        findings, pages = crawl_site(start_urls, org, fetcher, max_pages, progress, log, should_stop)
+        findings, pages, union_contacts = crawl_site(start_urls, org, fetcher, max_pages,
+                                                     progress, log, should_stop)
         if findings:
             save_union_site(org, start)  # reuse it next time instead of searching
     elif company:
         findings, pages = company_search(org, fetcher, max_pages, progress, log, should_stop)
+        union_contacts = set()
     else:
         progress(0, max_pages, "Looking for the students' union societies page")
-        found = find_union_site(org, fetcher, log)
-        start_urls = [found] if found else find_directories(org, log)
+        start_urls = find_union_site(org, fetcher, log) or find_directories(org, log)
         if not start_urls:
             return SearchResult(org, [], 0, [], note=(
                 "Couldn't find the students' union societies page automatically. Open the union's "
                 "website, find its Societies or Clubs A-Z page, and paste that address in."))
-        log("Starting from: " + ", ".join(start_urls))
-        findings, pages = crawl_site(start_urls, org, fetcher, max_pages, progress, log, should_stop)
+        log("Starting from: " + ", ".join(start_urls[:3]) +
+            (f" and {len(start_urls) - 3} more from the site map" if len(start_urls) > 3 else ""))
+        findings, pages, union_contacts = crawl_site(start_urls, org, fetcher, max_pages,
+                                                     progress, log, should_stop)
 
+    if union_contacts:
+        drop_union_contacts(findings, union_contacts, log)
+    office = drop_union_office_emails(findings)
+    if office:
+        log(f"Left out {plural(office, 'address', 'addresses')} belonging to the "
+            "union office rather than to a society.")
     remove_sitewide(findings)
     if deep and findings and not should_stop():
         improved = deep_search(findings, fetcher, progress, log, should_stop)
@@ -1431,8 +1771,15 @@ def run_search(name: str, url: Optional[str] = None, company: bool = False,
     if only_with_contacts:
         rows = [r for r in rows if r["email"] or r["phone"] or r["instagram"] or r["other_socials"]]
     rows.sort(key=lambda r: r["society"].lower())
-    note = "" if rows else ("No societies found. If you searched by name, try pasting the union's "
-                            "Societies A-Z page address instead.")
+    if rows:
+        note = ""
+    elif fetcher.pushed_back:
+        note = ("This union's website turned our requests away, so SocietyScout stopped visiting "
+                "it. Don't retry repeatedly. Email the union and ask for their societies list, or "
+                "add the societies you need by hand.")
+    else:
+        note = ("No societies found. If you searched by name, try pasting the union's "
+                "Societies A-Z page address instead.")
     return SearchResult(org, rows, pages, start_urls, note)
 
 
@@ -1649,6 +1996,7 @@ def coverage_summary() -> dict:
         "total": len(universities),
         "done": len(done),
         "no_page": sum(1 for r in coverage.values() if r.get("status") == "No societies page"),
+        "blocked": sum(1 for r in coverage.values() if r.get("status") == "Site blocked us"),
         "failed": sum(1 for r in coverage.values() if r.get("status") == "Failed"),
         "remaining": len([u for u in universities if norm(u["name"]) not in coverage]),
         "societies": sum(int(r.get("societies") or 0) for r in done),
@@ -1697,6 +2045,9 @@ def run_all(universities: Optional[list] = None, max_pages: int = DEFAULT_MAX_PA
                     note=f"{saved['added']} new, {saved['updated']} updated",
                 )
                 log(f"{name}: {len(result.rows)} societies.")
+            elif "turned our requests away" in result.note:
+                record.update(status="Site blocked us", note=result.note[:200])
+                log(f"{name}: the site asked us to stop. Skipping it.")
             else:
                 record.update(status="No societies page", note=result.note[:200])
                 log(f"{name}: nothing found.")
@@ -1710,6 +2061,241 @@ def run_all(universities: Optional[list] = None, max_pages: int = DEFAULT_MAX_PA
         save_coverage(coverage)  # saved after each one, so nothing is lost
         progress(i, total, f"{i} of {total} done")
     return coverage_summary()
+
+
+# ------------------------------------------------------------- diagnostics --
+
+def diagnose(target: str, delay: float = DEFAULT_DELAY) -> None:
+    """Walks the whole chain and says exactly where it breaks. Run this first
+    when a search comes back empty:  python scraper.py --diagnose "<name or url>"
+    """
+    line = "-" * 62
+    print(line)
+    print(f"Checking: {target}")
+    print(line)
+    is_url = bool(re.match(r"^https?://", target, re.I)) or "." in target.split("/")[0]
+    fetcher = Fetcher(delay=delay, log=lambda m: print(f"      {m}"))
+
+    # 1. Can this computer reach the web at all?
+    print("\n1. Internet connection")
+    try:
+        r = requests.get("https://example.com", timeout=15,
+                         headers={"User-Agent": USER_AGENT})
+        print(f"   OK (example.com answered {r.status_code})")
+    except requests.RequestException as exc:
+        print(f"   couldn't reach example.com ({exc.__class__.__name__})")
+        print("   That may just be a firewall blocking test sites, so the checks")
+        print("   below continue. If they all fail too, your internet or a work")
+        print("   firewall or VPN is blocking Python.")
+
+    # 2. Web search, which name-based lookups depend on
+    if not is_url:
+        print("\n2. Web search")
+        if setting("BRAVE_API_KEY"):
+            print("   Using your Brave API key.")
+        else:
+            print("   Using the free search (no key set).")
+        results = web_search(f"{target} students union", 5, log=lambda m: print(f"      {m}"))
+        if results:
+            print(f"   OK ({len(results)} results). First: {results[0].get('url', '')[:70]}")
+        else:
+            print("   FAILED: no results came back.")
+            print("   Free search often blocks repeated automated use. Wait 10 minutes,")
+            print("   or skip it entirely by pasting the union's societies page:")
+            print('     python scraper.py "Name" --url https://<union-site>/activities')
+            return
+    else:
+        print("\n2. Web search: skipped, you gave a web address.")
+
+    # 3. Which union website, and what does it allow?
+    print("\n3. The union website")
+    if is_url:
+        start = target if re.match(r"^https?://", target, re.I) else "https://" + target
+        starts = [normalise_url(start)]
+        print(f"   Using the address you gave: {starts[0]}")
+    else:
+        starts = find_union_site(target, fetcher, log=lambda m: print(f"      {m}"))
+        if not starts:
+            print("   FAILED: couldn't work out the union's societies page.")
+            print("   Open the union's website, find its Societies or Clubs A-Z page,")
+            print("   and pass it with --url. That always beats searching.")
+            return
+        print(f"   Found {plural(len(starts), 'starting page', 'starting pages')}.")
+        for u in starts[:3]:
+            print(f"     {u}")
+
+    root = f"{urlparse(starts[0]).scheme}://{urlparse(starts[0]).netloc}/"
+    print(f"\n4. What {bare_host(urlparse(root).netloc)} allows")
+    try:
+        rp = fetcher._robots_for(root)
+        print(f"   robots.txt read. Our crawl delay: "
+              f"{rp.crawl_delay(ROBOTS_NAME) or 'not set (using yours)'}")
+    except Exception as exc:
+        print(f"   Couldn't read robots.txt ({exc.__class__.__name__}); assuming allowed.")
+    for u in starts[:3]:
+        print(f"   {'allowed  ' if fetcher.allowed(u) else 'OFF LIMITS'} {u}")
+    if not any(fetcher.allowed(u) for u in starts[:3]):
+        print("   Every starting page is off limits to bots, so the crawl stops here.")
+        print("   This union has asked automated visitors not to read that page.")
+        print("   Add its societies by hand, or email the union's activities officer.")
+        return
+
+    # 5. Does the page actually contain society links?
+    print("\n5. Reading the starting page")
+    hosts = {bare_host(urlparse(u).netloc) for u in starts}
+    checked = 0
+    for u in starts[:3]:
+        try:
+            resp = fetcher.get(u)
+        except SiteRefusedError as exc:
+            print(f"   {u}\n     REFUSED: {exc}")
+            continue
+        if resp is None:
+            print(f"   {u}\n     nothing came back ({fetcher.last_outcome})")
+            continue
+        checked += 1
+        soup = BeautifulSoup(resp.content, "html.parser")
+        title = clean(soup.title.get_text()) if soup.title else "(no title)"
+        all_links = len(soup.find_all("a", href=True))
+        strip_page_chrome(soup)
+        links = society_links(soup, normalise_url(resp.url) or u, hosts)
+        text_len = len(clean(soup.get_text(" ")))
+        print(f"   {u}")
+        print(f"     title: {title[:60]}")
+        print(f"     {all_links} links on the page, {len(links)} look like societies")
+        print(f"     {text_len} characters of readable text")
+        if links:
+            print(f"     e.g. {links[0]}")
+        elif all_links < 10 and text_len < 900:
+            print("     This page is nearly empty without JavaScript, so its society")
+            print("     list is built in the browser and can't be read this way.")
+            print("     Try the site map, or add these societies by hand.")
+        else:
+            print("     The page loaded but no links matched the society patterns.")
+            print("     Send me this output and I'll adjust them for this union.")
+        break
+
+    # 6. A real, small run
+    print("\n6. A small live run (25 pages)")
+    res = run_search(target if not is_url else "Diagnostic run",
+                     url=starts[0] if is_url else None,
+                     max_pages=25, delay=delay,
+                     log=lambda m: print(f"      {m}"))
+    print(f"   pages checked: {res.pages_checked}")
+    print(f"   societies found: {len(res.rows)}")
+    if res.rows:
+        with_email = sum(1 for r in res.rows if r["email"])
+        print(f"   with an email: {with_email}")
+        for r in res.rows[:5]:
+            print(f"     - {r['society']}  {r['email'] or '(no email yet)'}")
+        print("\n   Working. Run it properly with a higher --max-pages.")
+    else:
+        print(f"   note: {res.note or 'none'}")
+        print("\n   Nothing found. Send me everything printed above and I'll fix it.")
+    if fetcher.pushed_back:
+        print(f"\n   Sites that turned us away: {', '.join(sorted(fetcher.pushed_back))}")
+    print(f"\n   Full request log: {AUDIT_LOG}")
+
+
+# ------------------------------------------- checking it against real sites --
+
+# Real students' union A-Z pages, on three different website platforms. Used by
+# --selftest to check the scraper against the live web rather than a rehearsal.
+SELFTEST_SITES = [
+    ("University of Stirling", "https://www.stirlingstudentsunion.com/sports-and-societies/societies/a-z-of-societies/"),
+    ("University of St Andrews", "https://www.yourunion.net/activities/societies/societiesa-z/"),
+]
+
+
+def selftest(extra_url: Optional[str] = None, max_pages: int = 40,
+             delay: float = DEFAULT_DELAY) -> None:
+    """Runs against real union websites and scores the three things that matter:
+    does it open the individual society pages, does it get blocked, and does it
+    keep the union's own contact details out of the societies."""
+    sites = list(SELFTEST_SITES)
+    if extra_url:
+        sites = [("Your site", extra_url)] + sites
+    print("Checking SocietyScout against live students' union websites.")
+    print(f"{plural(len(sites), 'site', 'sites')}, up to {max_pages} pages each. "
+          "This takes a few minutes.\n")
+
+    for name, url in sites:
+        print("=" * 64)
+        print(f"{name}\n{url}")
+        print("=" * 64)
+        fetcher_log: list = []
+        try:
+            res = run_search(name, url=url, max_pages=max_pages, delay=delay,
+                             log=fetcher_log.append,
+                             progress=lambda d, t, m: print(f"\r  {m}".ljust(72), end="", flush=True))
+        except SiteRefusedError as exc:
+            print(f"\n  BLOCKED: {exc}")
+            continue
+        except Exception as exc:
+            print(f"\n  FAILED: {exc.__class__.__name__}: {exc}")
+            continue
+        print()
+
+        rows = res.rows
+        blocked = [m for m in fetcher_log if "bot protection" in m or "asked us to slow down" in m]
+        robots = [m for m in fetcher_log if "asks bots not to visit" in m]
+
+        # 1. Did it go into the individual society pages?
+        print(f"  Societies found ........ {len(rows)}")
+        print(f"  Pages read ............. {res.pages_checked}")
+        unreachable = [m for m in fetcher_log if "Couldn't load" in m]
+        if unreachable and not rows:
+            print("  [----] couldn't reach the site at all:")
+            print(f"         {unreachable[0][:70]}")
+            print("         Check your internet, or a work firewall or VPN blocking Python.")
+            continue
+        verdict = "PASS" if res.pages_checked > 3 and len(rows) > 3 else "FAIL"
+        print(f"  [{verdict}] went through the individual society pages")
+        if verdict == "FAIL":
+            print("         (it stayed on the listing page — send me this output)")
+
+        # 2. Was it blocked?
+        if blocked:
+            print("  [FAIL] the site used bot protection or asked us to slow down:")
+            for m in blocked[:2]:
+                print(f"         {m[:70]}")
+        elif robots:
+            print(f"  [note] {plural(len(robots), 'page was', 'pages were')} off limits in "
+                  "robots.txt; the rest were read")
+        else:
+            print("  [PASS] no blocking")
+
+        # 3. Did any union-wide contact leak into the societies?
+        counts: Counter = Counter()
+        for r in rows:
+            for v in (r["email"], r["phone"], r["instagram"]):
+                if v:
+                    counts[v] += 1
+        shared = [(v, c) for v, c in counts.items() if c > 1 and c >= max(2, len(rows) * 0.4)]
+        office = [r["email"] for r in rows if r["email"] and UNION_EMAIL.match(r["email"])]
+        if shared or office:
+            print("  [FAIL] contact details that look like the union's own, not a society's:")
+            for v, c in shared[:3]:
+                print(f"         {v} appears on {c} societies")
+            for e in office[:3]:
+                print(f"         {e} is a union office address")
+        else:
+            print("  [PASS] no union-wide contact details attached to societies")
+
+        with_email = sum(1 for r in rows if r["email"])
+        with_cttee = sum(1 for r in rows if r["committee"])
+        print(f"\n  with an email .......... {with_email} of {len(rows)}")
+        print(f"  with committee names ... {with_cttee} of {len(rows)}")
+        for r in rows[:5]:
+            bits = [r["email"] or "(no email)"]
+            if r["committee"]:
+                bits.append(r["committee"][:40])
+            print(f"    - {r['society'][:34]:<34} {'  |  '.join(bits)}")
+        print()
+
+    print("=" * 64)
+    print("If anything says FAIL, send me this whole output and I'll fix it.")
+    print(f"Every request made is logged in {AUDIT_LOG}")
 
 
 # ------------------------------------------------------------ command line --
@@ -1788,6 +2374,12 @@ def main(argv=None) -> int:
     parser.add_argument("--redo", action="store_true", help="With --all, run universities already done again")
     parser.add_argument("--nation", help="With --all, limit to England, Scotland, Wales or Northern Ireland")
     parser.add_argument("--coverage", action="store_true", help="Show how far through the UK list you are")
+    parser.add_argument("--selftest", nargs="?", const="", metavar="URL",
+                        help="Check the scraper against real students' union websites. "
+                             "Optionally give your own A-Z page address to test as well.")
+    parser.add_argument("--diagnose", metavar="NAME_OR_URL",
+                        help="Work out why a search finds nothing. Give a university name "
+                             "or a societies page address.")
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="Pages to check per search")
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Seconds between requests")
     parser.add_argument("--deep", action="store_true",
@@ -1797,11 +2389,19 @@ def main(argv=None) -> int:
                         help="Leave out societies with no contact details")
     args = parser.parse_args(argv)
 
+    if args.selftest is not None:
+        selftest(args.selftest or None, max_pages=args.max_pages, delay=args.delay)
+        return 0
+
+    if args.diagnose:
+        diagnose(args.diagnose, delay=args.delay)
+        return 0
+
     if args.coverage:
         c = coverage_summary()
         print(f"{c['done']} of {c['total']} UK universities done, holding {c['societies']} societies.")
         print(f"  {c['remaining']} not tried yet, {c['no_page']} with no societies page found, "
-              f"{c['failed']} failed.")
+              f"{c['blocked']} blocked by the site, {c['failed']} failed.")
         if COVERAGE_CSV.exists():
             print(f"  Details: {COVERAGE_CSV}")
         return 0
