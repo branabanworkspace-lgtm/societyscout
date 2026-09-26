@@ -96,7 +96,7 @@ def running_in_cloud() -> bool:
 
 # Websites see this in every request, so site owners know who is visiting. Set
 # it here, or as SOCIETYSCOUT_CONTACT in your environment or Streamlit secrets.
-CONTACT_EMAIL = setting("SOCIETYSCOUT_CONTACT", "branaban.workspace@gmail.com")
+CONTACT_EMAIL = setting("SOCIETYSCOUT_CONTACT", "outreach@your-brand.co.uk")
 
 USER_AGENT = f"SocietyScout/1.0 (society outreach research; {CONTACT_EMAIL})"
 ROBOTS_NAME = "SocietyScout"
@@ -849,10 +849,23 @@ GENERIC_NAME = re.compile(
     r"a ?[-–] ?z.*|all .*|find .*|browse .*|start .*|search.*|our .*|join .*|about.*|contact.*|"
     r"committee.*|log ?in|sign ?in|sign ?up|register|page not found|not found|error.*|404.*|"
     r"events?|news|resources?|help|faqs?|instagram|facebook|twitter|x|tiktok|youtube|linkedin|"
+    r"get involved|getting involved|what'?s on|your union|support( ?(and|&) ?advice)?|"
+    r"advice|opportunities|venues|sports ?(and|&) ?societies|clubs ?(and|&) ?societies|"
+    r"societies ?(and|&) ?clubs|student (life|voice|activities)|memberships?|"
     r"e-?mail|website|more info.*|read more|view .*|menu|[\W_]*)$", re.I)
 
 
+# The union itself, not a society. Written tightly so real societies whose names
+# contain "Union" — Christian Union, Debating Union — are not caught.
+UNION_ORG_NAME = re.compile(
+    r"^(the\s+)?[\w'’&,\.\- ]*?(students'?\s*(union|association|guild)|guild of students|"
+    r"athletic union|sports union|union of students|university union|"
+    r"students'?\s*rep\w*)\s*$", re.I)
+
+
 def is_generic_name(name: str, org: str = "") -> bool:
+    if UNION_ORG_NAME.match(clean(name)):
+        return True
     n = clean(name)
     if len(n) < 2 or len(n) > 90 or GENERIC_NAME.match(n):
         return True
@@ -955,6 +968,7 @@ class Finding:
     committee: list = field(default_factory=list)
     own_sites: list = field(default_factory=list)   # the society's own website, if it links to one
     extra_from: list = field(default_factory=list)  # where deep search found anything extra
+    from_listing: bool = False   # reached from the union's societies list, so a real group
 
     def merge(self, other: "Finding") -> None:
         self.emails = dedupe(self.emails + other.emails)
@@ -962,6 +976,7 @@ class Finding:
         self.socials = dedupe(self.socials + other.socials)
         self.own_sites = dedupe(self.own_sites + other.own_sites)
         self.extra_from = dedupe(self.extra_from + other.extra_from)
+        self.from_listing = self.from_listing or other.from_listing
         names = {n.lower() for n, _ in self.committee}
         self.committee += [(n, r) for n, r in other.committee if n.lower() not in names]
 
@@ -1074,11 +1089,68 @@ SKIP_SEGMENTS = {"login", "logout", "signin", "sign-in", "register", "basket", "
 FILE_EXT = re.compile(r"\.(pdf|jpe?g|png|gif|svg|webp|ico|docx?|xlsx?|pptx?|zip|mp4|mp3|ics|css|js|"
                       r"json|xml|txt)$", re.I)
 LISTING_MIN_LINKS = 12
+MAX_LISTING_HOPS = 8   # how far it will follow "see the full list" style links
+
+# Wording unions use for the page that lists all their groups. Following these
+# is how the crawler gets from a home page to the actual A-Z.
+LISTING_WORDS = re.compile(
+    r"\b(a\s?-\s?z|a to z|atoz|all (of )?(our )?(societies|clubs|groups|teams)|"
+    r"(societ(y|ies)|clubs?|sports? clubs?|student groups?|student unions?|"
+    r"activities|get involved|join (a )?(club|society|group))|full list|"
+    r"browse (all )?(societies|clubs|groups))\b", re.I)
+
+
+def listing_candidates(soup, page_url: str, hosts: set[str]) -> list[str]:
+    """Links that look like they lead to a directory of societies or clubs."""
+    here = url_key(page_url)
+    scored: list[tuple[int, str]] = []
+    for a in soup.find_all("a", href=True):
+        url = normalise_url(urljoin(page_url, a["href"]))
+        if not url or url_key(url) == here:
+            continue
+        p = urlparse(url)
+        if bare_host(p.netloc) not in hosts and \
+                site_key(p.netloc) not in {site_key(h) for h in hosts}:
+            continue
+        if FILE_EXT.search(p.path) or social_url(url):
+            continue
+        label = clean(a.get_text(" "))
+        path = p.path.lower()
+        if any(seg in SKIP_SEGMENTS for seg in path.split("/") if seg):
+            continue
+        score = 0
+        if LISTING_WORDS.search(label):
+            score += 3
+        if LISTING_WORDS.search(path.replace("-", " ").replace("/", " ")):
+            score += 2
+        if re.search(r"a-?z|all-|list", path):
+            score += 2
+        if score:
+            scored.append((score, url))
+    out, seen = [], set()
+    for score, url in sorted(scored, key=lambda x: -x[0]):
+        k = url_key(url)
+        if k not in seen:
+            seen.add(k)
+            out.append(url)
+    return out[:4]
+
+
+UK_SECOND_LEVEL = {"ac", "co", "org", "gov", "sch", "net", "nhs"}
+
+
+def site_key(host: str) -> str:
+    """The site a host belongs to, so su.sheffield.ac.uk and sheffield.ac.uk
+    count as one place. Unions often split their pages across sub-domains."""
+    parts = bare_host(host).split(".")
+    if len(parts) >= 3 and parts[-1] == "uk" and parts[-2] in UK_SECOND_LEVEL:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:]) if len(parts) >= 2 else bare_host(host)
 
 
 def is_society_url(url: str, hosts: set[str]) -> bool:
     p = urlparse(url)
-    if bare_host(p.netloc) not in hosts:
+    if bare_host(p.netloc) not in hosts and site_key(p.netloc) not in {site_key(h) for h in hosts}:
         return False
     path = p.path.lower()
     if FILE_EXT.search(path):
@@ -1153,12 +1225,14 @@ def crawl_site(start_urls: list[str], org: str, fetcher: Fetcher, max_pages: int
                progress: ProgressFn, log: LogFn,
                should_stop: StopFn) -> tuple[list[Finding], int, set]:
     hosts = {bare_host(urlparse(u).netloc) for u in start_urls}
-    queue: deque = deque((u, None) for u in start_urls)
+    seeded_from_list = len(start_urls) > 3   # a site-map list of society pages
+    queue: deque = deque((u, None, seeded_from_list) for u in start_urls)
     seen = {url_key(u) for u in start_urls}
     findings: dict[str, Finding] = {}
     union_contacts: set = set()
     h1_seen: Counter = Counter()
     pages = 0
+    hops = 0
     sitemap_tried = False
 
     def add(f: Finding) -> None:
@@ -1168,12 +1242,13 @@ def crawl_site(start_urls: list[str], org: str, fetcher: Fetcher, max_pages: int
         else:
             findings[key] = f
 
-    def enqueue(url: str, parent: Optional[str] = None, front: bool = False) -> None:
+    def enqueue(url: str, parent: Optional[str] = None, front: bool = False,
+                from_listing: bool = False) -> None:
         key = url_key(url)
         if key in seen:
             return
         seen.add(key)
-        (queue.appendleft if front else queue.append)((url, parent))
+        (queue.appendleft if front else queue.append)((url, parent, from_listing))
 
     try:
         while pages < max_pages and not should_stop():
@@ -1186,7 +1261,7 @@ def crawl_site(start_urls: list[str], org: str, fetcher: Fetcher, max_pages: int
                     if queue:
                         continue
                 break
-            url, parent = queue.popleft()
+            url, parent, from_listing = queue.popleft()
             resp = fetcher.get(url)
             pages += 1
             progress(pages, max_pages, f"Checked {pages} pages, found {len(findings)} societies")
@@ -1221,17 +1296,34 @@ def crawl_site(start_urls: list[str], org: str, fetcher: Fetcher, max_pages: int
                     findings[parent].merge(extract_finding(soup, final_url, org, findings[parent].society))
                 continue
 
+            is_listing = len(content_links) >= LISTING_MIN_LINKS or \
+                len(links) >= LISTING_MIN_LINKS
             sub_keys = {url_key(u) for u in subpages}
             for link in links:
                 if url_key(link) not in sub_keys:
-                    enqueue(link)
+                    enqueue(link, from_listing=is_listing)
+
+            # A home page or hub page has few society links of its own. Rather
+            # than stopping there, follow its "Societies A-Z" or "Sports Clubs"
+            # link and carry on from the real list. Unions often keep sports
+            # clubs on a separate page from societies, so several are followed.
+            if len(links) < LISTING_MIN_LINKS and hops < MAX_LISTING_HOPS:
+                for cand in listing_candidates(soup, final_url, hosts):
+                    if url_key(cand) not in seen:
+                        hops += 1
+                        enqueue(cand, front=True)
+                        log(f"Following '{cand}' to look for the full list.")
+                        if hops >= MAX_LISTING_HOPS:
+                            break
 
             if len(content_links) >= LISTING_MIN_LINKS or not name or is_generic_name(name, org):
                 for f in inline_findings(soup, final_url, org):
+                    f.from_listing = True   # named inside the union's own list
                     add(f)
                 continue
 
             finding = extract_finding(soup, final_url, org, name)
+            finding.from_listing = from_listing
             add(finding)
             key = norm(finding.society)
             for sub in subpages:  # committee/contact pages often list the kit or merch secretary
@@ -1755,6 +1847,17 @@ def run_search(name: str, url: Optional[str] = None, company: bool = False,
 
     if union_contacts:
         drop_union_contacts(findings, union_contacts, log)
+    # The crawler passes through the union's own pages on its way to the lists —
+    # home, "Get Involved", "What's On". Those are not societies. A page counts
+    # as a society only if the union's own list linked to it, or if it carries
+    # contact details of its own once the union's have been taken out.
+    before_junk = len(findings)
+    findings = [f for f in findings
+                if f.from_listing or f.has_contact() or f.committee]
+    junk = before_junk - len(findings)
+    if junk:
+        log(f"Left out {plural(junk, 'union page', 'union pages')} that are not societies.")
+
     office = drop_union_office_emails(findings)
     if office:
         log(f"Left out {plural(office, 'address', 'addresses')} belonging to the "
