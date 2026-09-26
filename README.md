@@ -108,6 +108,90 @@ Get a Brave Search API key and set it as the `BRAVE_API_KEY` environment variabl
 
 You can host this on Streamlit Community Cloud so the team uses it in a browser with nothing to install. See `DEPLOY.md` for the steps. The short version: a hosted copy loses its saved data whenever it restarts, so run the big jobs on a laptop and use the hosted app for lookups and hand-added entries.
 
+## Finding its way to the full list
+
+Unions rarely put their societies at a predictable address. Stirling, for example, keeps societies at `/sports-and-societies/societies/a-z-of-societies/` and its 50+ sports clubs on a *separate* A-Z page.
+
+So if SocietyScout lands on a home page or a hub page, it looks for links worded like "A-Z of Societies", "All Clubs", "Sports Clubs" or "Student Groups" and follows them to the real list. It follows several, because societies and sports clubs are usually listed apart, and both are collected: sports teams and course societies included.
+
+It also treats a union's sub-domains as one site, so a union split across `su.example.ac.uk` and `example.ac.uk` is crawled properly rather than stopping at the boundary.
+
+The union's own entry is never recorded as a society, while societies whose names contain "Union" — Christian Union, Debating Union — are kept.
+
+## Checking it against real union websites
+
+```
+.venv\Scripts\python scraper.py --selftest          (Windows)
+.venv/bin/python scraper.py --selftest               (Mac)
+```
+
+It runs against two real students' union sites on different website platforms and scores the three things that matter: whether it opened the individual society pages rather than just the listing, whether it was blocked, and whether any union-wide contact detail ended up attached to a society. Add your own page with `--selftest https://<union-site>/societies` to check that one too.
+
+If anything comes back FAIL, send me the output.
+
+## When a search finds nothing
+
+Run the diagnostic. It walks the whole chain and tells you exactly which link breaks:
+
+```
+.venv/bin/python scraper.py --diagnose "University of Leeds"          (Mac)
+.venv\Scripts\python scraper.py --diagnose "University of Leeds"      (Windows)
+```
+
+Or point it straight at a page: `--diagnose https://<union-site>/activities`
+
+It checks your internet, whether web search is working, which union site it found, what that site's robots.txt allows, whether the page actually contains society links, and then does a small live run. The four things it usually turns up:
+
+1. **Web search returned nothing.** Free search blocks repeated automated use. Wait ten minutes, or skip searching altogether by passing the societies page with `--url`.
+2. **The page is empty without JavaScript.** Some unions build their society list in the browser, so there is nothing in the page to read. The site map is tried automatically; if that fails too, those societies need adding by hand.
+3. **The page is off limits in robots.txt.** Some unions allow their individual society pages but not their A-Z listing. SocietyScout then works from the site map instead. If everything is off limits, that union has asked bots not to read it, and the answer is to ask a person.
+4. **The page loaded but nothing matched.** Send me the diagnostic output and I'll adjust the patterns for that union.
+
+Passing `--url` with the union's own Societies or Clubs A-Z page is the single most reliable thing you can do. It skips searching entirely, and SocietyScout remembers the page for next time.
+
+## How it behaves towards the websites it reads
+
+It reads pages the way a slow, honest visitor would, and it never pretends to be someone else.
+
+- **It says what it is.** Every request carries a User-Agent naming SocietyScout and a `From` header with your contact email, so any site owner can see who is visiting and get in touch.
+- **It obeys robots.txt**, including each site's own requested crawl delay.
+- **It asks the site where its pages are.** It reads the site map rather than guessing at addresses. Guessing produces bursts of "not found" responses, which is what makes a firewall treat a visitor as a scanner.
+- **It waits** about two seconds between requests to the same site, with a little randomness so it isn't a heavy, metronomic load.
+- **It stops when told.** A 429 or 503 means wait and slow down; a 401 or 403 means stop asking that site altogether for the rest of the run. It doesn't argue and doesn't retry from a different angle.
+- **It only reads.** GET requests for ordinary pages. It never logs in, submits forms, or touches pages robots.txt puts off limits.
+- **It remembers pages it has read**, in `data/page_cache`, so running a search twice doesn't ask the site twice.
+- **It keeps a record.** `data/fetch_log.csv` lists every page requested and what came back, so if a university ever asks what you did, you can show them exactly.
+
+### Keeping the union's own pages out of the CSV
+
+On its way to the lists the crawler passes through the union's own pages — the home page, "Get Involved", "What's On". Those used to end up in the CSV as if they were societies, carrying the union's switchboard and info address.
+
+A page is now only recorded as a society if the union's own list linked to it, or if it carries contact details of its own once the union's have been taken out. That test is structural rather than a list of page titles, so it holds on unions whose pages are named something I've never seen.
+
+### Telling the union's contacts apart from a society's
+
+Every union page carries the union's own address and switchboard in its header and footer, and those must not end up in your outreach list as if they were a society's. Three things keep them out:
+
+1. Contact details found in a page's header, footer or menus are recorded as the union's and excluded from every society.
+2. Addresses of the form `theunion@`, `societies.union@`, `su@` and the like are never used as a society's contact, wherever they appear on the page.
+3. Any detail that turns up across a large share of societies is treated as site-wide and removed.
+
+A society with no address of its own is left with an empty Email and a note saying so. That is deliberate: a blank cell is more useful than the union office's address pretending to be a society's.
+
+### If a site blocks you anyway
+
+`data/coverage.csv` marks it, and the honest options are:
+
+SocietyScout now tells the difference between a site saying no and a bot-protection challenge (Cloudflare and similar), and names which it hit. A challenge page is a wall in front of everything automated, not a judgement about this tool, and no amount of polite retrying gets through it. The options are:
+
+1. **Slow down.** Run that university on its own with `--delay 5`, outside busy hours.
+2. **Skip the crawl entirely.** Most unions publish a societies list you can read yourself; add those entries by hand.
+3. **Ask.** A short email to the union's activities or membership officer explaining that you're a clothing brand wanting to contact societies about kit often gets you a better list than any scraper, and sometimes an introduction.
+
+### What this tool will not do
+
+It won't disguise itself as a web browser, rotate IP addresses or use proxy services, work around CAPTCHAs or bot protection, or ignore robots.txt. Those are ways of getting past a decision a site has made about who may visit, which puts you outside its terms of use and potentially on the wrong side of the Computer Misuse Act. A blocked site is a "no", and the answer is to ask a person, not to try a different disguise.
+
 ## Using the data responsibly
 
 Being publicly posted doesn't exempt contact details from UK GDPR. When you use them:
